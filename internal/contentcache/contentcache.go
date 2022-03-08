@@ -25,14 +25,14 @@ import (
 	"log"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
-	"strings"
 
 	"github.com/googlecloudplatform/gcsfuse/internal/gcsx"
 	"github.com/googlecloudplatform/gcsfuse/internal/logger"
 	"github.com/jacobsa/timeutil"
 )
+
+const CACHE_FILE_PREFIX = "gcsfusecache"
 
 // CacheObjectKey uniquely identifies GCS objects by bucket name and object name
 type CacheObjectKey struct {
@@ -44,8 +44,53 @@ type CacheObjectKey struct {
 type ContentCache struct {
 	debug      *log.Logger
 	tempDir    string
-	fileMap    map[CacheObjectKey]gcsx.TempFile
+	fileMap    map[CacheObjectKey]*CacheObject
 	mtimeClock timeutil.Clock
+}
+
+// Metadata store struct
+type CacheFileObjectMetadata struct {
+	CacheFileNameOnDisk string
+	BucketName          string
+	ObjectName          string
+	Generation          int64
+	MetaGeneration      int64
+}
+
+type CacheObject struct {
+	MetadataFileName        string
+	CacheFileObjectMetadata *CacheFileObjectMetadata
+	CacheFile               gcsx.TempFile
+}
+
+func (c *CacheObject) ValidateGeneration(generation int64, metaGeneration int64) bool {
+	if c.CacheFileObjectMetadata == nil {
+		return false
+	}
+	return c.CacheFileObjectMetadata.Generation == generation && c.CacheFileObjectMetadata.MetaGeneration == metaGeneration
+}
+
+func (c *ContentCache) WriteMetadataCheckpointFile(cacheFileName string, cacheFileObjectMetadata *CacheFileObjectMetadata) (metadataFileName string, err error) {
+	var file []byte
+	file, err = json.MarshalIndent(cacheFileObjectMetadata, "", " ")
+	if err != nil {
+		return
+	}
+	metadataFileName = fmt.Sprintf("%s.json", cacheFileName)
+	err = ioutil.WriteFile(metadataFileName, file, 0644)
+	if err != nil {
+		err = fmt.Errorf("%w", err)
+		return
+	}
+	return
+}
+
+func (c *CacheObject) Destroy() {
+	if c.CacheFile != nil {
+		os.Remove(c.CacheFile.Name())
+		c.CacheFile.Destroy()
+	}
+	os.Remove(c.MetadataFileName)
 }
 
 // RecoverFileFromCache recovers a file from the cache via metadata
@@ -57,7 +102,7 @@ func (c *ContentCache) RecoverFileFromCache(metadataFile fs.FileInfo) {
 	if !matchPattern(metadataFile.Name()) {
 		return
 	}
-	var metadata gcsx.TempFileObjectMetadata
+	var metadata CacheFileObjectMetadata
 	metadataAbsolutePath := path.Join(c.tempDir, metadataFile.Name())
 	contents, err := ioutil.ReadFile(metadataAbsolutePath)
 	// TODO ezl should we exec some sort of cleanup in the cache if there are errors
@@ -71,8 +116,7 @@ func (c *ContentCache) RecoverFileFromCache(metadataFile fs.FileInfo) {
 		return
 	}
 	cacheObjectKey := &CacheObjectKey{BucketName: metadata.BucketName, ObjectName: metadata.ObjectName}
-	// TODO ezl we should probably store the cached file name inside the cache file metadata instead of using the json file name
-	fileName := strings.TrimSuffix(metadataAbsolutePath, filepath.Ext(metadataFile.Name()))
+	fileName := metadata.CacheFileNameOnDisk
 	// TODO ezl linux fs limits single process to open max of 1024 file descriptors
 	// so this is not scalable
 	file, err := os.Open(fileName)
@@ -80,7 +124,12 @@ func (c *ContentCache) RecoverFileFromCache(metadataFile fs.FileInfo) {
 		c.debug.Printf("Skip cache file %v due to error: %s", fileName, err)
 		return
 	}
-	c.AddOrReplace(cacheObjectKey, metadata.Generation, file)
+	cacheFile, err := c.RecoverCacheFile(file)
+	if err != nil {
+		c.debug.Printf("Skip cache file %v due to error: %s", fileName, err)
+	}
+	cacheObject := &CacheObject{MetadataFileName: metadataAbsolutePath, CacheFileObjectMetadata: &metadata, CacheFile: cacheFile}
+	c.fileMap[*cacheObjectKey] = cacheObject
 }
 
 // RecoverCache recovers the cache with existing persisted files when gcsfuse starts
@@ -103,7 +152,7 @@ func (c *ContentCache) RecoverCache() error {
 // Helper function that matches the format of a gcsfuse file
 func matchPattern(fileName string) bool {
 	// TODO ezl: replace with constant defined in gcsx.TempFile
-	match, err := regexp.MatchString(fmt.Sprintf("%v[0-9]+[.]json", gcsx.CACHE_FILE_PREFIX), fileName)
+	match, err := regexp.MatchString(fmt.Sprintf("%v[0-9]+[.]json", CACHE_FILE_PREFIX), fileName)
 	if err != nil {
 		return false
 	}
@@ -115,7 +164,7 @@ func New(tempDir string, mtimeClock timeutil.Clock) *ContentCache {
 	return &ContentCache{
 		debug:      logger.NewDebug("content cache: "),
 		tempDir:    tempDir,
-		fileMap:    make(map[CacheObjectKey]gcsx.TempFile),
+		fileMap:    make(map[CacheObjectKey]*CacheObject),
 		mtimeClock: mtimeClock,
 	}
 }
@@ -127,27 +176,38 @@ func (c *ContentCache) NewTempFile(rc io.ReadCloser) (gcsx.TempFile, error) {
 }
 
 // AddOrReplace creates a new cache file or updates an existing cache file
-func (c *ContentCache) AddOrReplace(cacheObjectKey *CacheObjectKey, generation int64, rc io.ReadCloser) (gcsx.TempFile, error) {
+func (c *ContentCache) AddOrReplace(cacheObjectKey *CacheObjectKey, generation int64, metaGeneration int64, rc io.ReadCloser) (*CacheObject, error) {
 	if cacheObject, exists := c.fileMap[*cacheObjectKey]; exists {
 		cacheObject.Destroy()
 	}
-	metadata := &gcsx.TempFileObjectMetadata{
-		BucketName: cacheObjectKey.BucketName,
-		ObjectName: cacheObjectKey.ObjectName,
-		Generation: generation,
-	}
-	file, err := c.NewCacheFile(rc, metadata)
+
+	//Create a temporary cache file on disk
+	f, err := ioutil.TempFile(c.tempDir, CACHE_FILE_PREFIX)
 	if err != nil {
-		return nil, fmt.Errorf("Could not AddOrReplace cache file: %w", err)
+		return nil, fmt.Errorf("TempFile: %w", err)
 	}
-	c.fileMap[*cacheObjectKey] = file
-	return file, err
+	file, err := c.NewCacheFile(f, rc)
+	metadata := &CacheFileObjectMetadata{
+		CacheFileNameOnDisk: file.Name(),
+		BucketName:          cacheObjectKey.BucketName,
+		ObjectName:          cacheObjectKey.ObjectName,
+		Generation:          generation,
+		MetaGeneration:      metaGeneration,
+	}
+	var metadataFileName string
+	metadataFileName, err = c.WriteMetadataCheckpointFile(file.Name(), metadata)
+	cacheObject := &CacheObject{MetadataFileName: metadataFileName, CacheFileObjectMetadata: metadata, CacheFile: file}
+	if err != nil {
+		return nil, fmt.Errorf("WriteMetadataCheckpointFile: %w", err)
+	}
+	c.fileMap[*cacheObjectKey] = cacheObject
+	return cacheObject, err
 }
 
 // Get retrieves a file from the cache given the GCS object name and bucket name
-func (c *ContentCache) Get(cacheObjectKey *CacheObjectKey) (gcsx.TempFile, bool) {
-	file, exists := c.fileMap[*cacheObjectKey]
-	return file, exists
+func (c *ContentCache) Get(cacheObjectKey *CacheObjectKey) (*CacheObject, bool) {
+	cacheObject, exists := c.fileMap[*cacheObjectKey]
+	return cacheObject, exists
 }
 
 // Remove removes and destroys the specfied cache file and metadata on disk
@@ -160,6 +220,12 @@ func (c *ContentCache) Remove(cacheObjectKey *CacheObjectKey) {
 
 // NewCacheFile creates a cache file on the disk storing the object content
 // TODO ezl we should refactor reading/writing cache files and metadata to a different package
-func (c *ContentCache) NewCacheFile(rc io.ReadCloser, metadata *gcsx.TempFileObjectMetadata) (gcsx.TempFile, error) {
-	return gcsx.NewCacheFile(rc, metadata, c.tempDir, c.mtimeClock)
+func (c *ContentCache) NewCacheFile(f *os.File, rc io.ReadCloser) (gcsx.TempFile, error) {
+	return gcsx.NewCacheFile(rc, f, c.tempDir, c.mtimeClock)
+}
+
+// NewCacheFile creates a cache file on the disk storing the object content
+// TODO ezl we should refactor reading/writing cache files and metadata to a different package
+func (c *ContentCache) RecoverCacheFile(f *os.File) (gcsx.TempFile, error) {
+	return gcsx.RecoverCacheFile(f, c.tempDir, c.mtimeClock)
 }

@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/googlecloudplatform/gcsfuse/internal/gcsx"
+	"github.com/googlecloudplatform/gcsfuse/internal/contentcache"
 	"google.golang.org/api/iterator"
 )
 
@@ -36,21 +36,21 @@ const NUM_WORKERS = 10
 func downloadFile(ctx context.Context, client *storage.Client, object *storage.ObjectAttrs, cacheDir string) (err error) {
 	log.Printf(fmt.Sprintf("downloading file %v from bucket %v into dir %v", object.Name, object.Bucket, cacheDir))
 
-	// TODO ezl store the file name inside the json metadata instead of stripping the metadata filename
-	metadata := &gcsx.TempFileObjectMetadata{
-		BucketName:     object.Bucket,
-		ObjectName:     object.Name,
-		Generation:     object.Generation,
-		MetaGeneration: object.Metageneration,
-	}
-
 	// TODO ezl refactor once we decouple content cache from gcsx
 	// Create a temporary cache file on disk
 	// TODO ezl concerns about partial download and cache file corruption
 	// We may want a way to verify the files are fully downloaded
 	// and either resuming the download or discarding and redownloading the file
 	// We may also want to do cleanup if files are created on disk but aren't populated in time
-	f, err := ioutil.TempFile(cacheDir, gcsx.CACHE_FILE_PREFIX)
+	f, err := ioutil.TempFile(cacheDir, contentcache.CACHE_FILE_PREFIX)
+
+	metadata := &contentcache.CacheFileObjectMetadata{
+		CacheFileNameOnDisk: f.Name(),
+		BucketName:          object.Bucket,
+		ObjectName:          object.Name,
+		Generation:          object.Generation,
+		MetaGeneration:      object.Metageneration,
+	}
 
 	if err != nil {
 		err = fmt.Errorf("ioutil.TempFile: %w", err)

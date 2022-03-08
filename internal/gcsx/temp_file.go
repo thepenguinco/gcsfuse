@@ -15,10 +15,8 @@
 package gcsx
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"time"
@@ -26,10 +24,6 @@ import (
 	"github.com/jacobsa/fuse/fsutil"
 	"github.com/jacobsa/timeutil"
 )
-
-// cache file prefix to identify the file as coming from gcsfuse
-// TODO ezl move this to new package after refactor
-const CACHE_FILE_PREFIX = "gcsfusecache"
 
 // TempFile is a temporary file that keeps track of the lowest offset at which
 // it has been modified.
@@ -45,6 +39,9 @@ type TempFile interface {
 	io.WriterAt
 	Truncate(n int64) (err error)
 
+	// Retrieve the file name
+	Name() string
+
 	// Return information about the current state of the content. May invalidate
 	// the seek position.
 	Stat() (sr StatResult, err error)
@@ -52,9 +49,6 @@ type TempFile interface {
 	// Explicitly set the mtime that will return in stat results. This will stick
 	// until another method that modifies the file is called.
 	SetMtime(mtime time.Time)
-
-	// Validate the generation number of the file
-	ValidateGeneration(generation int64) bool
 
 	// Throw away the resources used by the temporary file. The object must not
 	// be used again.
@@ -78,15 +72,6 @@ type StatResult struct {
 	// If neither of those things has ever happened, it is nil. This implies that
 	// DirtyThreshold == Size.
 	Mtime *time.Time
-}
-
-// Metadata store struct
-type TempFileObjectMetadata struct {
-	NameOnDisk     string
-	BucketName     string
-	ObjectName     string
-	Generation     int64
-	MetaGeneration int64
 }
 
 // NewTempFile creates a temp file whose initial contents are given by the
@@ -121,27 +106,42 @@ func NewTempFile(
 // TODO ezl we should refactor reading/writing cache files and metadata to a different package
 func NewCacheFile(
 	source io.ReadCloser,
-	tempFileObjectMetadata *TempFileObjectMetadata,
+	f *os.File,
 	dir string,
 	clock timeutil.Clock) (tf TempFile, err error) {
 
-	//Create a temporary cache file on disk
-	f, err := ioutil.TempFile(dir, CACHE_FILE_PREFIX)
-	if err != nil {
-		err = fmt.Errorf("TempFile: %w", err)
-		return
+	tf = &tempFile{
+		source:         source,
+		state:          fileIncomplete,
+		clock:          clock,
+		f:              f,
+		dirtyThreshold: 0,
 	}
 
-	file, _ := json.MarshalIndent(*tempFileObjectMetadata, "", " ")
-	_ = ioutil.WriteFile(fmt.Sprintf("%s.json", f.Name()), file, 0644)
+	return
+}
+
+// RecoverCacheFile creates wrapper struct around a cache file on disk
+// dir is a directory on whose file system the file will live,
+// or the system default temporary location if empty.
+// TODO ezl we should refactor reading/writing cache files and metadata to a different package
+func RecoverCacheFile(
+	f *os.File,
+	dir string,
+	clock timeutil.Clock) (tf TempFile, err error) {
+
+	stat, err := f.Stat()
+
+	if err != nil {
+		return nil, fmt.Errorf("could not retrieve file stats: %w", err)
+	}
 
 	tf = &tempFile{
-		source:                 source,
-		tempFileObjectMetadata: tempFileObjectMetadata,
-		state:                  fileIncomplete,
-		clock:                  clock,
-		f:                      f,
-		dirtyThreshold:         0,
+		source:         f,
+		state:          fileComplete,
+		clock:          clock,
+		f:              f,
+		dirtyThreshold: stat.Size(),
 	}
 
 	return
@@ -172,9 +172,6 @@ type tempFile struct {
 
 	// A file containing our current contents.
 	f *os.File
-
-	// Metadata for the temp file
-	tempFileObjectMetadata *TempFileObjectMetadata
 
 	// The lowest byte index that has been modified from the initial contents.
 	//
@@ -231,8 +228,6 @@ func (tf *tempFile) Destroy() {
 	// Throw away the file (for anonymous files).
 	tf.f.Close()
 
-	// TODO ezl Throw away the cache file and metadata
-	// when the local file cache is enabled
 	tf.f = nil
 }
 
@@ -319,11 +314,8 @@ func (tf *tempFile) SetMtime(mtime time.Time) {
 	tf.mtime = &mtime
 }
 
-func (tf *tempFile) ValidateGeneration(generation int64) bool {
-	if tf.tempFileObjectMetadata == nil {
-		return false
-	}
-	return tf.tempFileObjectMetadata.Generation == generation
+func (tf *tempFile) Name() string {
+	return tf.f.Name()
 }
 
 ////////////////////////////////////////////////////////////////////////
